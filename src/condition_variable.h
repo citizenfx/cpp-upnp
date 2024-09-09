@@ -9,17 +9,20 @@
 #include <upnp/detail/cancel.h>
 #include <upnp/third_party/net.h>
 
+#include <optional>
+
 namespace upnp {
 
 class ConditionVariable {
-    using Sig = void(boost::system::error_code);
-
     using IntrusiveHook = boost::intrusive::list_base_hook
         <boost::intrusive::link_mode
             <boost::intrusive::auto_unlink>>;
 
+    using HandlerType = boost::asio::async_result<boost::asio::yield_context,
+                                               void(boost::system::error_code)>::handler_type;
+
     struct WaitEntry : IntrusiveHook {
-        std::function<Sig> handler;
+        std::optional<HandlerType> handler;
     };
 
     using IntrusiveList = boost::intrusive::list
@@ -63,32 +66,32 @@ void ConditionVariable::notify(const boost::system::error_code& ec)
 {
     while (!_on_notify.empty()) {
         auto& e = _on_notify.front();
-        net::post(_exec, [h = std::move(e.handler), ec] () mutable { h(ec); });
+        net::post(_exec, [h = std::move(e.handler), ec] () mutable
+        {
+            h.value()(ec);
+        });
         _on_notify.pop_front();
     }
 }
-
+   
 inline
-void ConditionVariable::wait(cancel_t& cancel, net::yield_context yield)
+void ConditionVariable::wait(cancel_t& cancel, boost::asio::yield_context yield)
 {
-    auto work = net::make_work_guard(_exec);
-
     WaitEntry entry;
+    auto work = net::make_work_guard(_exec);
+    net::async_initiate<boost::asio::yield_context, void(boost::system::error_code)>(
+        [this, &work, &cancel, &entry](HandlerType&& handler) {
+            entry.handler.emplace(std::forward<decltype(handler)>(handler));
+            _on_notify.push_back(std::move(entry));
+            auto slot = cancel.connect([&] {
+                assert(entry.is_linked());
+                if (entry.is_linked()) entry.unlink();
 
-    net::async_completion<net::yield_context, Sig> init(yield);
-    entry.handler = std::move(init.completion_handler);
-    _on_notify.push_back(entry);
-
-    auto slot = cancel.connect([&] {
-        assert(entry.is_linked());
-        if (entry.is_linked()) entry.unlink();
-
-        net::post(_exec, [h = std::move(entry.handler)] () mutable {
-            h(net::error::operation_aborted);
-        });
-    });
-
-    return init.result.get();
+                net::post(_exec, [h = std::move(entry.handler)] () mutable {
+                    h.value()(boost::asio::error::operation_aborted);
+                });
+            });
+        }, yield);
 }
 
 inline
